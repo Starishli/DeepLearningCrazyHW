@@ -10,15 +10,14 @@ Loading all the numpy files containing the utterance information and text inform
 
 
 def load_data():
-    # speech_train = np.load('train_new.npy', allow_pickle=True, encoding='bytes')
+    speech_train = np.load('train_new.npy', allow_pickle=True, encoding='bytes')
     speech_valid = np.load('dev_new.npy', allow_pickle=True, encoding='bytes')
     speech_test = np.load('test_new.npy', allow_pickle=True, encoding='bytes')
 
-    # transcript_train = np.load('train_transcripts.npy', allow_pickle=True,encoding='bytes')
+    transcript_train = np.load('train_transcripts.npy', allow_pickle=True,encoding='bytes')
     transcript_valid = np.load('dev_transcripts.npy', allow_pickle=True, encoding='bytes')
 
-    return speech_valid, speech_valid, speech_test, transcript_valid, transcript_valid
-    # return speech_train, speech_valid, speech_test, transcript_train, transcript_valid
+    return speech_train, speech_valid, speech_test, transcript_train, transcript_valid
 
 
 '''
@@ -49,6 +48,17 @@ def transform_letter_to_index(transcript, letter2index):
         full_res.append(np.array(cur_res))
             
     return np.array(full_res)
+
+
+def transform_index_to_letter(index_arr, letter_list):
+    """
+    :param index_arr :(N, ) index
+    :param letter_list: index2index dict
+    :return transcript:
+    """
+    transcript = "".join([letter_list[i] for i in index_arr[1:-1]])
+
+    return transcript
 
 
 '''

@@ -1,9 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.utils as utils
+import numpy as np
+
 from torch import Tensor
+from torch.distributions.categorical import Categorical
+from torch.nn.utils.rnn import pad_sequence
+
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+SOS_INDEX = 33
+EOS_INDEX = 34
 
 
 class Attention(nn.Module):
@@ -60,7 +67,7 @@ class pBLSTM(nn.Module):
         self.lstm_2 = nn.LSTM(input_size=hidden_dim * 4, hidden_size=hidden_dim, num_layers=1, bidirectional=True)
         self.lstm_3 = nn.LSTM(input_size=hidden_dim * 4, hidden_size=hidden_dim, num_layers=1, bidirectional=True)
 
-        self.lstm_layers = [self.lstm_1, self.lstm_2, self.lstm_3]
+        self.lstm_layers = nn.ModuleList([self.lstm_1, self.lstm_2, self.lstm_3])
 
     def forward(self, x):
         """
@@ -68,17 +75,38 @@ class pBLSTM(nn.Module):
         :return output: (N, T, H) encoded sequence from pyramidal Bi-LSTM
         """
 
-        for i, lstm_layer in enumerate(self.lstm_layers):
-            x, lens = utils.rnn.pad_packed_sequence(x, batch_first=False)
+        x, lens = utils.rnn.pad_packed_sequence(x, batch_first=False)
 
-            x = torch.transpose(x, 0, 1)
-            x = x[:x.shape[0] // 2 * 2, :x.shape[1] // 2 * 2, :x.shape[2] // 2 * 2]
-            x = x.reshape((x.shape[0], x.shape[1] // 2, x.shape[2] * 2))
-            x = torch.transpose(x, 0, 1)
-            lens = lens // 2
+        x = torch.transpose(x, 0, 1)
+        x = x[:x.shape[0], :x.shape[1] // 2 * 2, :]
+        x = x.reshape((x.shape[0], x.shape[1] // 2, x.shape[2] * 2))
+        x = torch.transpose(x, 0, 1)
+        lens = lens // 2
 
-            cur_inp = utils.rnn.pack_padded_sequence(x, lengths=lens, batch_first=False, enforce_sorted=False)
-            x, _ = lstm_layer(cur_inp)
+        cur_inp = utils.rnn.pack_padded_sequence(x, lengths=lens, batch_first=False, enforce_sorted=False)
+        x, _ = self.lstm_1(cur_inp)
+
+        x, lens = utils.rnn.pad_packed_sequence(x, batch_first=False)
+
+        x = torch.transpose(x, 0, 1)
+        x = x[:x.shape[0], :x.shape[1] // 2 * 2, :]
+        x = x.reshape((x.shape[0], x.shape[1] // 2, x.shape[2] * 2))
+        x = torch.transpose(x, 0, 1)
+        lens = lens // 2
+
+        cur_inp = utils.rnn.pack_padded_sequence(x, lengths=lens, batch_first=False, enforce_sorted=False)
+        x, _ = self.lstm_2(cur_inp)
+
+        x, lens = utils.rnn.pad_packed_sequence(x, batch_first=False)
+
+        x = torch.transpose(x, 0, 1)
+        x = x[:x.shape[0], :x.shape[1] // 2 * 2, :]
+        x = x.reshape((x.shape[0], x.shape[1] // 2, x.shape[2] * 2))
+        x = torch.transpose(x, 0, 1)
+        lens = lens // 2
+
+        cur_inp = utils.rnn.pack_padded_sequence(x, lengths=lens, batch_first=False, enforce_sorted=False)
+        x, _ = self.lstm_3(cur_inp)
 
         return x
 
@@ -133,6 +161,8 @@ class Decoder(nn.Module):
         if is_attended:
             self.attention = Attention()
 
+        self.teacher_forcing_rate = 0.6
+
         self.character_prob = nn.Linear(key_size + value_size, vocab_size)
 
     def forward(self, key, values, lens, text=None, is_train=True):
@@ -156,7 +186,7 @@ class Decoder(nn.Module):
 
         predictions = []
         hidden_states = [None, None]
-        prediction = torch.zeros(batch_size, 1).to(DEVICE)
+        prediction = (torch.ones(batch_size, 1) * SOS_INDEX).to(DEVICE)
 
         attention_score = values.mean(dim=0)
 
@@ -167,7 +197,13 @@ class Decoder(nn.Module):
             #   out of the loop so you do you do not get index out of range errors. 
 
             if is_train:
-                char_embed = embeddings[:, i, :]
+
+                rnd = np.random.rand()
+
+                if rnd >= self.teacher_forcing_rate:
+                    char_embed = embeddings[:, i, :]
+                else:
+                    char_embed = self.embedding(prediction.argmax(dim=-1))
             else:
                 char_embed = self.embedding(prediction.argmax(dim=-1))
 
@@ -194,7 +230,7 @@ class Seq2Seq(nn.Module):
     We train an end-to-end sequence to sequence model comprising of Encoder and Decoder.
     This is simply a wrapper "model" for your encoder and decoder.
     """
-    def __init__(self, input_dim, vocab_size, hidden_dim, value_size=128, key_size=128, is_attended=False):
+    def __init__(self, input_dim, vocab_size, hidden_dim, value_size, key_size, is_attended=True):
         super(Seq2Seq, self).__init__()
         self.encoder = Encoder(input_dim, hidden_dim, value_size, key_size)
         self.decoder = Decoder(vocab_size, hidden_dim, value_size, key_size, is_attended)
@@ -205,27 +241,24 @@ class Seq2Seq(nn.Module):
         if is_train:
             predictions = self.decoder(key, value, lens, text_input)
         else:
-            predictions = self.decoder(key, value, lens, text=None, isTrain=False)
+            predictions = self.decoder(key, value, lens, text=None, is_train=False)
 
         return predictions
 
 
-if __name__ == "__main__":
-    batch_size_ = 5
-    timesteps_ = 4
-    key_size_ = 3
-    value_size_ = 3
+def greedy_search_gen(outputs):
+    decoded_outputs = torch.argmax(outputs, dim=2)
 
-    print(DEVICE)
+    decoded_outputs = torch.cat([torch.ones((decoded_outputs.shape[0], 1), dtype=torch.int64).to(DEVICE) * SOS_INDEX,
+                                 decoded_outputs], dim=1)
 
-    query_ = torch.ones(batch_size_, key_size_).to(DEVICE)
-    key_ = torch.ones(timesteps_, batch_size_, key_size_).to(DEVICE)
-    value_ = torch.ones(timesteps_, batch_size_, value_size_).to(DEVICE)
-    lens_ = torch.ones(batch_size_) * 4
+    cur_text_len = torch.zeros(decoded_outputs.shape[0], dtype=torch.int64).to(DEVICE)
+    cur_text = []
 
-    result = Attention()(query_, key_, value_, lens_)
-    print("**Example Expected:**\n{}".format(result))
+    for i in range(decoded_outputs.shape[0]):
+        cur_text_len[i] = next(j for j in range(decoded_outputs.shape[1])
+                               if (decoded_outputs[i][j] == EOS_INDEX or j == decoded_outputs.shape[1] - 1)) + 1
 
+        cur_text.append(decoded_outputs[i][:cur_text_len[i]])
 
-
-
+    return cur_text, cur_text_len
